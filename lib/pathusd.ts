@@ -7,6 +7,13 @@ export const PATHUSD_ADDRESS =
 
 export const PATHUSD_DECIMALS = 6;
 
+/**
+ * Tempo pays gas in TIP-20 stablecoins, so a pathUSD payment transaction also
+ * contains a small pathUSD transfer from the payer to this fee collector.
+ * Verified on live testnet transactions — it must never be read as the payment.
+ */
+export const TEMPO_FEE_ADDRESS = "0xfeec000000000000000000000000000000000000";
+
 /** What the user sees next to every amount. */
 export const PATHUSD_LABEL = "pathUSD (test USD)";
 
@@ -44,15 +51,18 @@ export function parseAmount(input: string): bigint {
   return value;
 }
 
-/** 5000000n -> "5.00". Never goes through a float. */
+/**
+ * 600000000n -> "600.00": exactly `formatUnits(value, 6)` to two places, with
+ * no thousands separator, so what the explorer calls 600 the card calls 600.00.
+ * Never goes through a float.
+ */
 export function formatAmount(value: bigint): string {
   const raw = formatUnits(value, PATHUSD_DECIMALS);
   const negative = raw.startsWith("-");
   const body = negative ? raw.slice(1) : raw;
   const [whole, fraction = ""] = body.split(".");
   const cents = (fraction + "00").slice(0, 2);
-  const grouped = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-  return `${negative ? "-" : ""}${grouped}.${cents}`;
+  return `${negative ? "-" : ""}${whole}.${cents}`;
 }
 
 export function parseAddress(input: string): `0x${string}` {

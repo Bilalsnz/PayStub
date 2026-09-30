@@ -9,6 +9,7 @@ import { copyText, formatTime, shortAddress } from "@/lib/format";
 import {
   PATHUSD_ADDRESS,
   PATHUSD_LABEL,
+  TEMPO_FEE_ADDRESS,
   explorerTxUrl,
   formatAmount,
   isTxHash,
@@ -63,75 +64,99 @@ function stripMemo(memo: string): `0x${string}` | null {
   return /^0x0+$/.test(memo) ? null : (memo.toLowerCase() as `0x${string}`);
 }
 
-/**
- * Pulls the job payment out of the transaction logs: the pathUSD transfer that
- * the payer actually sent, with its memo when the event carries one.
- */
-function extractPayment(logs: readonly Log[], payer: string): Payment | null {
-  const found: Payment[] = [];
-  const payerLower = payer.toLowerCase();
+type Candidate = Payment & { withMemo: boolean };
 
-  for (const log of logs) {
-    if (log.address.toLowerCase() !== PATHUSD_ADDRESS.toLowerCase()) continue;
+/** Decodes one pathUSD log, or null if it is not a transfer we care about. */
+function readLog(log: Log): Candidate | null {
+  if (log.address.toLowerCase() !== PATHUSD_ADDRESS.toLowerCase()) return null;
 
-    const topics = log.topics as readonly string[];
-    let from: `0x${string}` | null = null;
-    let to: `0x${string}` | null = null;
-    let value: bigint | null = null;
-    let memo: `0x${string}` | null = null;
+  const topics = log.topics as readonly string[];
 
-    try {
-      const decoded = decodeEventLog({
-        abi: PATHUSD_ABI,
-        data: log.data,
-        topics: log.topics,
-      }) as unknown as { eventName: string; args: Record<string, unknown> };
+  try {
+    const decoded = decodeEventLog({
+      abi: PATHUSD_ABI,
+      data: log.data,
+      topics: log.topics,
+    }) as unknown as { eventName: string; args: Record<string, unknown> };
 
-      if (decoded.eventName === "TransferWithMemo" || decoded.eventName === "Transfer") {
-        from = decoded.args.from as `0x${string}`;
-        to = decoded.args.to as `0x${string}`;
-        value = decoded.args.value as bigint;
-        memo =
-          decoded.eventName === "TransferWithMemo"
-            ? stripMemo(decoded.args.memo as string)
-            : null;
-      }
-    } catch {
-      // Fall back to reading the raw log: topic0, two indexed addresses, the
-      // value in the data, and for TransferWithMemo the memo in topic[3].
-      const isTransfer = topics[0] === TRANSFER_TOPIC && topics.length >= 3;
-      const isMemoTransfer = topics[0] === TRANSFER_WITH_MEMO_TOPIC && topics.length >= 4;
-
-      if ((isTransfer || isMemoTransfer) && log.data.length >= 66) {
-        from = `0x${topics[1].slice(26)}` as `0x${string}`;
-        to = `0x${topics[2].slice(26)}` as `0x${string}`;
-        try {
-          value = BigInt(log.data.slice(0, 66));
-        } catch {
-          value = null;
-        }
-        memo = isMemoTransfer ? stripMemo(topics[3]) : null;
-      }
+    if (decoded.eventName === "TransferWithMemo") {
+      return {
+        from: decoded.args.from as `0x${string}`,
+        to: decoded.args.to as `0x${string}`,
+        value: decoded.args.value as bigint,
+        memo: stripMemo(decoded.args.memo as string),
+        withMemo: true,
+      };
     }
 
-    if (!from || !to || value === null) continue;
-    found.push({ from, to, value, memo });
+    if (decoded.eventName === "Transfer") {
+      return {
+        from: decoded.args.from as `0x${string}`,
+        to: decoded.args.to as `0x${string}`,
+        value: decoded.args.value as bigint,
+        memo: null,
+        withMemo: false,
+      };
+    }
+
+    return null;
+  } catch {
+    // Raw-log fallback: topic0, two indexed addresses, the value in the data,
+    // and for TransferWithMemo the memo in topic[3].
+    const isMemoTransfer = topics[0] === TRANSFER_WITH_MEMO_TOPIC && topics.length >= 4;
+    const isTransfer = topics[0] === TRANSFER_TOPIC && topics.length >= 3;
+    if ((!isMemoTransfer && !isTransfer) || log.data.length < 66) return null;
+
+    try {
+      return {
+        from: `0x${topics[1].slice(26)}` as `0x${string}`,
+        to: `0x${topics[2].slice(26)}` as `0x${string}`,
+        value: BigInt(log.data.slice(0, 66)),
+        memo: isMemoTransfer ? stripMemo(topics[3]) : null,
+        withMemo: isMemoTransfer,
+      };
+    } catch {
+      return null;
+    }
   }
+}
 
-  if (found.length === 0) return null;
+/**
+ * Reads exactly ONE transfer out of the transaction — never a sum.
+ *
+ * Two traps, both confirmed against live testnet transactions:
+ *
+ * 1. pathUSD emits BOTH `Transfer` and `TransferWithMemo` for a single
+ *    `transferWithMemo` call, with the same value. Summing them doubled every
+ *    receipt — a 600 payment read back as 1200.
+ * 2. Tempo pays gas in TIP-20, so the same transaction also carries a small
+ *    pathUSD transfer from the payer to the fee collector. That is not the
+ *    payment either, so "the first Transfer from the payer" is unsafe.
+ *
+ * `TransferWithMemo` is the unambiguous one — the fee transfer never carries a
+ * memo. The payee comes from that event's own `to`; `tx.to` is always the
+ * pathUSD contract, because that is the contract that was called.
+ */
+function extractPayment(logs: readonly Log[], payer: string): Payment | null {
+  const payerLower = payer.toLowerCase();
 
-  const sent = found.filter((payment) => payment.from.toLowerCase() === payerLower);
-  const relevant = sent.length > 0 ? sent : found;
-  const to = relevant[0].to;
-  const sameRecipient = relevant.filter(
-    (payment) => payment.to.toLowerCase() === to.toLowerCase(),
-  );
+  const candidates = logs
+    .map(readLog)
+    .filter((candidate): candidate is Candidate => candidate !== null)
+    .filter((candidate) => candidate.to.toLowerCase() !== TEMPO_FEE_ADDRESS.toLowerCase())
+    .filter((candidate) => candidate.to.toLowerCase() !== PATHUSD_ADDRESS.toLowerCase());
+
+  if (candidates.length === 0) return null;
+
+  const fromPayer = candidates.filter((candidate) => candidate.from.toLowerCase() === payerLower);
+  const pool = fromPayer.length > 0 ? fromPayer : candidates;
+  const chosen = pool.find((candidate) => candidate.withMemo) ?? pool[0];
 
   return {
-    from: relevant[0].from,
-    to,
-    value: sameRecipient.reduce((total, payment) => total + payment.value, 0n),
-    memo: sameRecipient.find((payment) => payment.memo)?.memo ?? null,
+    from: chosen.from,
+    to: chosen.to,
+    value: chosen.value,
+    memo: chosen.memo,
   };
 }
 

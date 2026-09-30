@@ -23,11 +23,20 @@ import {
   parseAddress,
   parseAmount,
 } from "@/lib/pathusd";
+import { WALLET_LABEL, type WalletId, okxDeepLink, walletInstalled } from "@/lib/wagmi";
 
 const INPUT =
-  "mt-1.5 w-full rounded-xl border border-line bg-card px-3.5 py-3 leading-snug tracking-tight text-ink outline-none placeholder:text-muted/50 focus:border-accent";
+  "mt-1.5 w-full rounded-xl border border-line bg-canvas px-3.5 py-3 leading-snug tracking-tight text-ink outline-none placeholder:text-muted/50 focus:border-accent";
 const PRIMARY =
   "w-full rounded-2xl bg-accent px-4 py-4 text-[16px] font-semibold text-white disabled:opacity-40";
+
+const WALLET_ORDER: WalletId[] = ["okx", "metamask", "rabby"];
+
+const WALLET_HINT: Record<WalletId, { here: string; away: string }> = {
+  okx: { here: "Pay from the OKX app", away: "Opens OKX on this phone" },
+  metamask: { here: "Pay from MetaMask", away: "Not in this browser" },
+  rabby: { here: "Pay from Rabby", away: "Not in this browser" },
+};
 
 type WalletProvider = {
   request?: (args: { method: string; params?: unknown[] }) => Promise<unknown>;
@@ -66,7 +75,7 @@ function isUserRejection(error: unknown): boolean {
 async function ensureTempoChain(): Promise<void> {
   const provider = getInjectedProvider();
   if (!provider?.request) {
-    throw new Error("Open this site inside OKX Wallet or MetaMask in-app browser.");
+    throw new Error("No wallet in this browser. Connect one first.");
   }
 
   const current = await provider.request({ method: "eth_chainId" });
@@ -106,15 +115,23 @@ export default function HomePage() {
   const router = useRouter();
 
   const [mounted, setMounted] = useState(false);
-  const [hasProvider, setHasProvider] = useState(false);
+  const [installed, setInstalled] = useState<Record<WalletId, boolean>>({
+    okx: false,
+    metamask: false,
+    rabby: false,
+  });
 
   useEffect(() => {
     setMounted(true);
-    setHasProvider(Boolean(getInjectedProvider()));
+    setInstalled({
+      okx: walletInstalled("okx"),
+      metamask: walletInstalled("metamask"),
+      rabby: walletInstalled("rabby"),
+    });
   }, []);
 
   const { address, chainId, isConnected } = useAccount();
-  const { connectors, connectAsync, isPending: isConnecting } = useConnect();
+  const { connectors, connectAsync } = useConnect();
   const { disconnect } = useDisconnect();
   const { writeContractAsync } = useWriteContract();
 
@@ -122,6 +139,8 @@ export default function HomePage() {
   const [amount, setAmount] = useState("");
   const [note, setNote] = useState("");
   const [formError, setFormError] = useState<string | null>(null);
+  const [walletHint, setWalletHint] = useState<string | null>(null);
+  const [connectingId, setConnectingId] = useState<WalletId | null>(null);
   const [isPaying, setIsPaying] = useState(false);
   const [isSwitching, setIsSwitching] = useState(false);
   const [faucetBusy, setFaucetBusy] = useState(false);
@@ -142,26 +161,43 @@ export default function HomePage() {
     query: { enabled: Boolean(address), refetchInterval: 8000 },
   });
 
-  async function handleConnect() {
+  /**
+   * Connects to one specific wallet. If that wallet is not in this browser the
+   * button does something useful rather than nothing: OKX hands off to the OKX
+   * app, the other two say so plainly.
+   */
+  async function handleWallet(id: WalletId) {
     setFormError(null);
-    if (!getInjectedProvider()) {
-      setFormError("Open this site inside OKX Wallet or MetaMask in-app browser.");
-      return;
-    }
-    try {
-      const preferred =
-        connectors.find((connector) => /okx/i.test(connector.name)) ??
-        connectors.find((connector) => connector.id === "injected") ??
-        connectors[0];
+    setWalletHint(null);
 
-      if (!preferred) {
-        setFormError("Open this site inside OKX Wallet or MetaMask in-app browser.");
+    if (mounted && !installed[id]) {
+      if (id === "okx") {
+        window.location.href = okxDeepLink(window.location.href);
         return;
       }
-      await connectAsync({ connector: preferred });
+      setWalletHint(`${WALLET_LABEL[id]} is not in this browser. Open this page inside it.`);
+      return;
+    }
+
+    const connector = connectors.find((candidate) => candidate.id === id);
+    if (!connector) {
+      setWalletHint(`${WALLET_LABEL[id]} is not in this browser. Open this page inside it.`);
+      return;
+    }
+
+    setConnectingId(id);
+    try {
+      await connectAsync({ connector });
     } catch (error) {
-      if (isUserRejection(error)) return;
-      setFormError(errorMessage(error) || "Could not connect the wallet.");
+      if (!isUserRejection(error)) {
+        setWalletHint(
+          /provider|not found|no provider/i.test(errorMessage(error))
+            ? `${WALLET_LABEL[id]} is not in this browser. Open this page inside it.`
+            : errorMessage(error) || `Could not connect ${WALLET_LABEL[id]}.`,
+        );
+      }
+    } finally {
+      setConnectingId(null);
     }
   }
 
@@ -222,7 +258,7 @@ export default function HomePage() {
     }
 
     if (!isConnected) {
-      await handleConnect();
+      setFormError("Pick a wallet above first.");
       return;
     }
 
@@ -231,8 +267,11 @@ export default function HomePage() {
       await ensureTempoChain();
 
       const trimmed = note.trim();
-      let hash: `0x${string}`;
 
+      // transferWithMemo carries the job note. Only if it genuinely fails does
+      // the payment fall back to a plain transfer — never both, or the receipt
+      // would carry two transfers for one job.
+      let hash: `0x${string}`;
       try {
         hash = await writeContractAsync({
           address: PATHUSD_ADDRESS,
@@ -242,8 +281,6 @@ export default function HomePage() {
           chainId: tempoTestnet.id,
         });
       } catch (error) {
-        // The memo is a nicety. If this build of pathUSD will not take it, the
-        // job still has to get paid — plain transfer, same receipt hash.
         if (isUserRejection(error)) throw error;
         hash = await writeContractAsync({
           address: PATHUSD_ADDRESS,
@@ -270,223 +307,263 @@ export default function HomePage() {
     !wrongNetwork &&
     payee.trim().length > 0 &&
     amount.trim().length > 0 &&
-    !isPaying &&
-    !isConnecting;
+    !isPaying;
 
   return (
-    <main className="mx-auto w-full max-w-[430px] px-4 pt-7 pb-14">
-      <header className="flex items-center justify-between">
-        <span className="text-[15px] font-semibold tracking-tight">PayStub</span>
-        <span className="text-[11px] font-semibold tracking-[0.14em] text-muted uppercase">
-          Tempo Testnet
-        </span>
+    <div className="min-h-dvh bg-canvas">
+      <header className="bg-accent">
+        <div className="mx-auto flex w-full max-w-[430px] items-center justify-between px-4 py-4">
+          <span className="text-[15px] font-semibold tracking-tight text-white">PayStub</span>
+          <span className="text-[10px] font-semibold tracking-[0.16em] text-white/75 uppercase">
+            Tempo Testnet
+          </span>
+        </div>
       </header>
 
-      <h1 className="mt-8 text-[30px] leading-[1.15] font-semibold tracking-tight">
-        Get a receipt both sides can trust.
-      </h1>
-      <p className="mt-3 text-[15px] leading-relaxed text-muted">
-        Pay a job in USD on Tempo. Both of you open the same page: paid, amount, note, proof.
-      </p>
-
-      <section className="mt-7 rounded-[20px] border border-line bg-card p-5">
-        <StepLabel>01 Amount</StepLabel>
-
-        <Field label="Payee address">
-          <input
-            className={INPUT}
-            value={payee}
-            onChange={(event) => setPayee(event.target.value)}
-            placeholder="0x…"
-            inputMode="text"
-            autoComplete="off"
-            autoCorrect="off"
-            autoCapitalize="off"
-            spellCheck={false}
-          />
-        </Field>
-
-        <Field label="Amount">
-          <input
-            className={INPUT}
-            value={amount}
-            onChange={(event) => setAmount(event.target.value)}
-            placeholder="5.00"
-            inputMode="decimal"
-            autoComplete="off"
-          />
-          <span className="mt-1.5 block text-[12px] text-muted">{PATHUSD_LABEL}</span>
-        </Field>
-
-        <Field label="Job note">
-          <textarea
-            className={`${INPUT} resize-none`}
-            value={note}
-            onChange={(event) => setNote(event.target.value)}
-            placeholder="Logo for flyer"
-            rows={2}
-            maxLength={NOTE_MAX}
-          />
-          <span className="mt-1.5 flex items-baseline justify-between text-[12px] text-muted">
-            <span>Rides onchain in the payment memo.</span>
-            <span className="tabular-nums">
-              {note.length}/{NOTE_MAX}
-            </span>
-          </span>
-        </Field>
-      </section>
-
-      <section className="mt-4 rounded-[20px] border border-line bg-card p-5">
-        <StepLabel>02 Pay</StepLabel>
-
-        {!mounted ? (
-          <div className="mt-4 h-[54px] w-full rounded-2xl bg-canvas" />
-        ) : !hasProvider ? (
-          <p className="mt-4 rounded-xl bg-canvas px-3.5 py-3 text-[14px] leading-relaxed">
-            Open this site inside OKX Wallet or MetaMask in-app browser.
-          </p>
-        ) : !isConnected ? (
-          <>
-            <button
-              type="button"
-              onClick={handleConnect}
-              disabled={isConnecting}
-              className={`mt-4 ${PRIMARY} disabled:opacity-100`}
-            >
-              {isConnecting ? "Connecting…" : "Connect wallet"}
-            </button>
-            <p className="mt-2 text-[12px] leading-relaxed text-muted">
-              Your address is used for one thing: sending this payment.
-            </p>
-          </>
-        ) : (
-          <>
-            <div className="mt-4 flex items-center justify-between rounded-xl bg-canvas px-3.5 py-3">
-              <div className="min-w-0">
-                <div className="text-[10px] font-semibold tracking-[0.14em] text-muted uppercase">
-                  Paying from
-                </div>
-                <div className="mt-0.5 font-mono text-[14px]">{shortAddress(address, 6)}</div>
-              </div>
-              <button
-                type="button"
-                onClick={() => disconnect()}
-                className="shrink-0 pl-3 text-[12px] font-semibold text-muted underline"
-              >
-                Disconnect
-              </button>
-            </div>
-
-            <div className="mt-3 flex items-center justify-between rounded-xl bg-canvas px-3.5 py-3">
-              <div>
-                <div className="text-[10px] font-semibold tracking-[0.14em] text-muted uppercase">
-                  Balance
-                </div>
-                <div className="mt-0.5 text-[15px] font-semibold tabular-nums">
-                  {typeof balance === "bigint"
-                    ? `${formatAmount(balance)} pathUSD`
-                    : balanceFetching
-                      ? "Checking…"
-                      : "—"}
-                </div>
-              </div>
-
-              {balance === 0n && !faucetBusy ? (
-                <button
-                  type="button"
-                  onClick={handleFaucet}
-                  className="shrink-0 rounded-full border border-line bg-card px-3.5 py-2 text-[13px] font-semibold"
-                >
-                  Get test USD
-                </button>
-              ) : null}
-
-              {faucetBusy ? (
-                <span className="pulse shrink-0 text-[12px] text-muted">Sending…</span>
-              ) : null}
-            </div>
-
-            {faucetNote ? <p className="mt-2 text-[12px] text-muted">{faucetNote}</p> : null}
-
-            {wrongNetwork ? (
-              <>
-                <button
-                  type="button"
-                  onClick={handleSwitch}
-                  disabled={isSwitching}
-                  className="mt-4 w-full rounded-2xl bg-warn-bg px-4 py-4 text-[16px] font-semibold text-warn-ink disabled:opacity-60"
-                >
-                  {isSwitching ? "Switching…" : "Switch to Tempo Testnet"}
-                </button>
-                <p className="mt-2 text-[12px] leading-relaxed text-muted">
-                  Payments only go out on Tempo Testnet. Your wallet is on another chain right now.
-                </p>
-              </>
-            ) : null}
-
-            <button
-              type="button"
-              onClick={handlePay}
-              disabled={!canPay}
-              className={`mt-4 ${PRIMARY}`}
-            >
-              {isPaying ? "Check your wallet…" : "Pay and issue receipt"}
-            </button>
-          </>
-        )}
-
-        {formError ? (
-          <p className="mt-3 rounded-xl bg-warn-bg px-3.5 py-3 text-[13px] leading-relaxed text-warn-ink">
-            {formError}
-          </p>
-        ) : null}
-      </section>
-
-      <section className="mt-4 rounded-[20px] border border-line bg-card p-5">
-        <StepLabel>03 Receipt</StepLabel>
-        <p className="mt-3 text-[13px] leading-relaxed text-muted">
-          The moment the payment lands you get a public page with the proof on it. Send that link to
-          the worker. No account, nothing to install.
+      <main className="mx-auto w-full max-w-[430px] px-4 pb-14">
+        <h1 className="mt-7 text-[34px] leading-[1.08] font-semibold tracking-tight text-ink">
+          Get a receipt both sides can trust.
+        </h1>
+        <p className="mt-3 text-[15px] leading-relaxed text-muted">
+          Pay a job in USD on Tempo. Both of you open the same page: paid, amount, note, proof.
         </p>
 
-        <div className="mt-4 rounded-[16px] border border-dashed border-line p-4">
-          <div className="flex items-baseline justify-between">
-            <span className="text-[10px] font-semibold tracking-[0.14em] text-muted uppercase">
-              Preview layout only
+        <section className="mt-6 rounded-[20px] border border-line bg-card p-5">
+          <StepLabel n="01">Amount</StepLabel>
+
+          <Field label="Payee address">
+            <input
+              className={INPUT}
+              value={payee}
+              onChange={(event) => setPayee(event.target.value)}
+              placeholder="0x…"
+              inputMode="text"
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
+            />
+          </Field>
+
+          <Field label="Amount">
+            <input
+              className={INPUT}
+              value={amount}
+              onChange={(event) => setAmount(event.target.value)}
+              placeholder="5.00"
+              inputMode="decimal"
+              autoComplete="off"
+            />
+            <span className="mt-1.5 block text-[12px] text-muted">{PATHUSD_LABEL}</span>
+          </Field>
+
+          <Field label="Job note">
+            <textarea
+              className={`${INPUT} resize-none`}
+              value={note}
+              onChange={(event) => setNote(event.target.value)}
+              placeholder="Logo for flyer"
+              rows={2}
+              maxLength={NOTE_MAX}
+            />
+            <span className="mt-1.5 flex items-baseline justify-between text-[12px] text-muted">
+              <span>Rides onchain in the payment memo.</span>
+              <span className="tabular-nums">
+                {note.length}/{NOTE_MAX}
+              </span>
             </span>
-            <span className="font-mono text-[10px] text-muted">/r/…</span>
-          </div>
+          </Field>
+        </section>
 
-          <div className="mt-3 text-[40px] leading-none font-semibold tracking-tight text-accent/35">
-            PAID
-          </div>
-          <div className="mt-3 text-[20px] font-semibold tracking-tight text-muted tabular-nums">
-            —.— pathUSD
-          </div>
+        <section className="mt-4 rounded-[20px] border border-line bg-card p-5">
+          <StepLabel n="02">Pay</StepLabel>
 
-          <dl className="mt-4 space-y-2 text-[13px] text-muted">
-            {["Note", "Payer", "Payee", "Time"].map((label) => (
-              <div key={label} className="flex items-baseline justify-between gap-4">
-                <dt>{label}</dt>
-                <dd>—</dd>
+          {!mounted ? (
+            <div className="mt-4 space-y-2">
+              <div className="h-[62px] w-full rounded-2xl bg-canvas" />
+              <div className="h-[62px] w-full rounded-2xl bg-canvas" />
+              <div className="h-[62px] w-full rounded-2xl bg-canvas" />
+            </div>
+          ) : !isConnected ? (
+            <div className="mt-4 space-y-2">
+              {WALLET_ORDER.map((id) => (
+                <WalletButton
+                  key={id}
+                  label={WALLET_LABEL[id]}
+                  hint={installed[id] ? WALLET_HINT[id].here : WALLET_HINT[id].away}
+                  busy={connectingId === id}
+                  onClick={() => handleWallet(id)}
+                />
+              ))}
+            </div>
+          ) : (
+            <>
+              <div className="mt-4 flex items-center justify-between rounded-xl bg-canvas px-3.5 py-3">
+                <div className="min-w-0">
+                  <div className="text-[10px] font-semibold tracking-[0.14em] text-muted uppercase">
+                    Paying from
+                  </div>
+                  <div className="mt-0.5 font-mono text-[14px]">{shortAddress(address, 6)}</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => disconnect()}
+                  className="shrink-0 pl-3 text-[12px] font-semibold text-accent underline"
+                >
+                  Disconnect
+                </button>
               </div>
-            ))}
-          </dl>
-        </div>
-      </section>
 
-      <footer className="mt-8 text-center text-[12px] leading-relaxed text-muted">
-        Not a bank. Onchain receipt on Tempo. Colosseum World's Fair.
-      </footer>
-    </main>
+              <div className="mt-3 flex items-center justify-between rounded-xl bg-canvas px-3.5 py-3">
+                <div>
+                  <div className="text-[10px] font-semibold tracking-[0.14em] text-muted uppercase">
+                    Balance
+                  </div>
+                  <div className="mt-0.5 text-[15px] font-semibold tabular-nums">
+                    {typeof balance === "bigint"
+                      ? `${formatAmount(balance)} pathUSD`
+                      : balanceFetching
+                        ? "Checking…"
+                        : "—"}
+                  </div>
+                </div>
+
+                {balance === 0n && !faucetBusy ? (
+                  <button
+                    type="button"
+                    onClick={handleFaucet}
+                    className="shrink-0 rounded-xl border border-line bg-card px-3.5 py-2 text-[13px] font-semibold text-accent"
+                  >
+                    Get test USD
+                  </button>
+                ) : null}
+
+                {faucetBusy ? (
+                  <span className="pulse shrink-0 text-[12px] text-muted">Sending…</span>
+                ) : null}
+              </div>
+
+              {faucetNote ? <p className="mt-2 text-[12px] text-muted">{faucetNote}</p> : null}
+
+              {wrongNetwork ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={handleSwitch}
+                    disabled={isSwitching}
+                    className="mt-4 w-full rounded-2xl bg-warn-bg px-4 py-4 text-[16px] font-semibold text-warn-ink disabled:opacity-60"
+                  >
+                    {isSwitching ? "Switching…" : "Switch to Tempo Testnet"}
+                  </button>
+                  <p className="mt-2 text-[12px] leading-relaxed text-muted">
+                    Payments only go out on Tempo Testnet. Your wallet is on another chain right
+                    now.
+                  </p>
+                </>
+              ) : null}
+
+              <button
+                type="button"
+                onClick={handlePay}
+                disabled={!canPay}
+                className={`mt-4 ${PRIMARY}`}
+              >
+                {isPaying ? "Check your wallet…" : "Pay and issue receipt"}
+              </button>
+            </>
+          )}
+
+          {walletHint ? <p className="mt-3 text-[12px] text-muted">{walletHint}</p> : null}
+
+          {formError ? (
+            <p className="mt-3 rounded-xl bg-warn-bg px-3.5 py-3 text-[13px] leading-relaxed text-warn-ink">
+              {formError}
+            </p>
+          ) : null}
+
+          <p className="mt-3 text-[11px] leading-relaxed text-muted">
+            New Vercel apps get a MetaMask malicious warning — tick Acknowledge then Confirm.
+          </p>
+        </section>
+
+        <section className="mt-4 rounded-[20px] border border-line bg-card p-5">
+          <StepLabel n="03">Receipt</StepLabel>
+          <p className="mt-3 text-[13px] leading-relaxed text-muted">
+            The moment the payment lands you get a public page with the proof on it. Send that link
+            to the worker. No account, nothing to install.
+          </p>
+
+          <div className="mt-4 rounded-2xl border border-dashed border-line bg-canvas p-4">
+            <div className="flex items-baseline justify-between">
+              <span className="text-[10px] font-semibold tracking-[0.14em] text-muted uppercase">
+                Preview layout only
+              </span>
+              <span className="font-mono text-[10px] text-muted">/r/…</span>
+            </div>
+
+            <div className="mt-3 text-[40px] leading-none font-semibold tracking-tight text-accent/35">
+              PAID
+            </div>
+            <div className="mt-3 text-[20px] font-semibold tracking-tight text-muted tabular-nums">
+              —.— pathUSD
+            </div>
+
+            <dl className="mt-4 space-y-2 text-[13px] text-muted">
+              {["Note", "Payer", "Payee", "Time"].map((label) => (
+                <div key={label} className="flex items-baseline justify-between gap-4">
+                  <dt>{label}</dt>
+                  <dd>—</dd>
+                </div>
+              ))}
+            </dl>
+          </div>
+        </section>
+
+        <footer className="mt-8 text-center text-[12px] leading-relaxed text-muted">
+          Not a bank. Onchain receipt on Tempo. Colosseum World's Fair.
+        </footer>
+      </main>
+    </div>
   );
 }
 
-function StepLabel({ children }: { children: React.ReactNode }) {
+function StepLabel({ n, children }: { n: string; children: React.ReactNode }) {
   return (
-    <div className="text-[11px] font-semibold tracking-[0.14em] text-muted uppercase">
-      {children}
+    <div className="flex items-baseline gap-2">
+      <span className="text-[13px] font-semibold tracking-tight text-accent tabular-nums">{n}</span>
+      <span className="text-[11px] font-semibold tracking-[0.14em] text-muted uppercase">
+        {children}
+      </span>
     </div>
+  );
+}
+
+function WalletButton({
+  label,
+  hint,
+  busy,
+  onClick,
+}: {
+  label: string;
+  hint: string;
+  busy: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={busy}
+      className="flex w-full items-center justify-between rounded-2xl border border-line bg-card px-4 py-3.5 text-left disabled:opacity-60"
+    >
+      <span className="min-w-0">
+        <span className="block text-[15px] font-semibold tracking-tight text-ink">{label}</span>
+        <span className="mt-0.5 block text-[12px] text-muted">{hint}</span>
+      </span>
+      <span className="shrink-0 pl-3 text-[13px] font-semibold text-accent">
+        {busy ? "Opening…" : "Connect"}
+      </span>
+    </button>
   );
 }
 

@@ -110,9 +110,9 @@ requests), that curl does the same thing — run it from any terminal and refres
 
 Two minutes, one phone, no slides.
 
-1. **Open the site in the OKX Wallet in-app browser** (or MetaMask's). If you open it in a normal
-   browser with no wallet, PayStub says so instead of failing: *"Open this site inside OKX Wallet or
-   MetaMask in-app browser."*
+1. **Open the site in the OKX Wallet in-app browser** (or MetaMask's). In a plain browser you get
+   three wallet buttons — OKX, MetaMask, Rabby — and tapping OKX there hands off to the OKX app
+   through a deep link instead of doing nothing.
 2. **Tap Connect wallet.** If the wallet has never seen Tempo, tap **Switch to Tempo Testnet** and
    approve the add-network prompt. This is the only setup step, and it happens once.
 3. **Tap Get test USD.** The balance goes from `0.00` to a funded balance in a few seconds.
@@ -127,6 +127,9 @@ Two minutes, one phone, no slides.
 8. **Tap Open explorer** to land on `https://explore.testnet.tempo.xyz/tx/0x…`.
 
 To repeat: the faucet drips on demand, and a fresh address works every time.
+
+> MetaMask shows a *"this site might be malicious"* warning on brand-new `*.vercel.app` domains.
+> Tick **Acknowledge** then **Confirm**. It is the domain's age, not the app.
 
 ---
 
@@ -158,8 +161,13 @@ wallet.
    Tempo…"** and polls every 2 seconds. Nothing is ever rendered as PAID before the chain says so.
 2. If the receipt says `reverted`, the page shows **FAILED** — no pathUSD moved, so there is nothing
    to receipt.
-3. Otherwise it decodes the `Transfer` / `TransferWithMemo` logs from `pathUSD`, takes the transfer
-   the payer actually sent, sums it, and reads the memo back into text.
+3. Otherwise it decodes the `Transfer` / `TransferWithMemo` logs from `pathUSD` and reads **exactly
+   one** transfer — never a sum. Two traps here, both confirmed against live testnet
+   transactions: pathUSD emits *both* events for a single `transferWithMemo` call with the same
+   value (summing them doubled every receipt), and Tempo pays gas in TIP-20, so the same
+   transaction also carries a small pathUSD transfer to the fee collector. `TransferWithMemo` is
+   the unambiguous one. The payee is that event's own `to` — `tx.to` is always the pathUSD
+   contract, because that is the contract that was called.
 4. If the transaction is real but contains no pathUSD transfer, the page says so plainly instead of
    dressing it up as a payment.
 5. If the hash is malformed, or half a minute passes with nothing found, it shows **"Receipt not
@@ -240,7 +248,7 @@ app/
   r/[txHash]/receipt-view.tsx   reads the chain, renders PAID / Confirming / Not found
 lib/
   chains.ts               defineChain for Tempo testnet + mainnet, add-chain params
-  wagmi.ts                injected connector, official RPC transports, ssr
+  wagmi.ts                three targeted injected connectors (OKX/MetaMask/Rabby) + OKX deep link
   abi.ts                  the pathUSD ABI — the only contract in the project
   pathusd.ts              address, parse/format, packMemo, explorerTxUrl, faucet()
   format.ts               address shortening, time, clipboard that survives in-app browsers
