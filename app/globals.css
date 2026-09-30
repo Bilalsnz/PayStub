@@ -1,0 +1,73 @@
+@import "tailwindcss";
+
+@source "../app";
+@source "../lib";
+
+@theme {
+  --color-canvas: #f6f7fb;
+  --color-ink: #0b0b0f;
+  --color-accent: #2563ff;
+  --color-muted: #6b7280;
+  --color-card: #ffffff;
+  --color-line: #e5e7eb;
+  --color-warn-bg: #fef3c7;
+  --color-warn-ink: #92400e;
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+}
+
+html,
+body {
+  max-width: 100%;
+  overflow-x: hidden;
+}
+
+body {
+  background-color: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* iOS zooms any input under 16px when it is focused. */
+input,
+textarea,
+select {
+  font-size: 16px;
+}
+
+::selection {
+  background: var(--color-accent);
+  color: #ffffff;
+}
+
+@keyframes paystub-fade {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.fade-in {
+  animation: paystub-fade 240ms ease-out both;
+}
+
+@keyframes paystub-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.pulse {
+  animation: paystub-pulse 1.4s ease-in-out infinite;
+}
