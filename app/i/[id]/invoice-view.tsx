@@ -93,8 +93,8 @@ export function InvoiceView({
   }, [invoiceId, paramTo, paramAmount, paramNote, paramAt, paramDue]);
 
   const runScan = useCallback(
-    async (showSpinner: boolean) => {
-      if (!invoice) return;
+    async (showSpinner: boolean): Promise<boolean> => {
+      if (!invoice) return false;
       if (showSpinner) setScan({ kind: "scanning" });
 
       try {
@@ -106,15 +106,20 @@ export function InvoiceView({
         });
 
         if (!payment) {
-          setScan({ kind: "unpaid" });
-          return;
+          // A miss must never take a paid invoice back to UNPAID. The node that
+          // answers this query is not necessarily the one that served the
+          // receipt, and logs can trail a beat behind the block.
+          setScan((prev) => (prev.kind === "paid" ? prev : { kind: "unpaid" }));
+          return false;
         }
 
         const timestamp = await blockTimestamp(payment.blockNumber);
         setScan({ kind: "paid", payment, timestamp });
         markPaid(invoice.id, payment.txHash);
+        return true;
       } catch (error) {
         if (showSpinner) setScan({ kind: "error", detail: errorMessage(error) });
+        return false;
       }
     },
     [invoice],
@@ -156,7 +161,15 @@ export function InvoiceView({
       await waitForPayment(hash);
 
       markPaid(invoice.id, hash);
-      await runScan(false);
+
+      // The receipt is in hand, but the log query that proves it to the page
+      // can land on a node a beat behind. Retry before ever letting an invoice
+      // the user just paid read as UNPAID.
+      let seen = false;
+      for (let attempt = 0; attempt < 5 && !seen; attempt += 1) {
+        if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 1_000));
+        seen = await runScan(false);
+      }
     } catch (error) {
       if (!isUserRejection(error)) {
         setPayError(errorMessage(error) || SWITCH_HELP);
