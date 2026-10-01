@@ -78,19 +78,17 @@ type RequestProvider = {
   request: (args: { method: string; params?: unknown[] }) => Promise<unknown>;
 };
 
-function asRequestProvider(value: unknown): RequestProvider | null {
+function asRequestProvider(value: unknown): RequestProvider | undefined {
   const candidate = value as { request?: unknown } | null | undefined;
   return candidate && typeof candidate.request === "function"
     ? (candidate as RequestProvider)
-    : null;
+    : undefined;
 }
 
 /** Whatever wallet this browser has, when no specific connector is in play. */
 export function getInjectedProvider(): RequestProvider | undefined {
   const w = readWindow();
-  if (w.okxwallet?.request) return w.okxwallet as RequestProvider;
-  if (w.ethereum?.request) return w.ethereum as RequestProvider;
-  return undefined;
+  return asRequestProvider(w.okxwallet) ?? asRequestProvider(w.ethereum);
 }
 
 /** The EIP-1193 provider behind a wagmi connector, if it can produce one. */

@@ -6,10 +6,11 @@ import {
   http,
   isAddress,
   parseUnits,
-  type Log,
+  type AbiEvent,
   type PublicClient,
 } from "viem";
 
+import { PATHUSD_ABI } from "./abi";
 import { TEMPO_EXPLORER_URL, TEMPO_RPC_URL, tempoTestnet } from "./chains";
 
 export const PATHUSD_ADDRESS =
@@ -183,6 +184,16 @@ export async function faucet(address: string): Promise<FaucetResult> {
 export const TRANSFER_WITH_MEMO_TOPIC: `0x${string}` =
   "0x57bc7354aa85aed339e000bccffabbc529466af35f0772c8f8ee1145927de7f0";
 
+/**
+ * The same event as an ABI item, lifted out of the one ABI this app ships so
+ * the question asked of the node cannot drift from the contract it is asking
+ * about. viem derives the topics from this — `from` is left open, `to` and
+ * `memo` are pinned — which lands on exactly `[topic0, null, payee, INV-xxxx]`.
+ */
+const TRANSFER_WITH_MEMO_EVENT = PATHUSD_ABI.find(
+  (item) => item.type === "event" && item.name === "TransferWithMemo",
+) as AbiEvent;
+
 /** The node rejects any eth_getLogs wider than 100,000 blocks. Measured, not guessed. */
 export const MAX_LOG_RANGE = 100_000;
 
@@ -215,8 +226,16 @@ export type InvoicePayment = {
   blockNumber: bigint;
 };
 
-function decodeInvoiceLog(log: Log): InvoicePayment | null {
-  const topics = log.topics as readonly string[];
+/** The only four fields a log has to carry to be read as a payment. */
+type RawLog = {
+  topics: readonly string[];
+  data: string;
+  transactionHash: `0x${string}` | null;
+  blockNumber: bigint | null;
+};
+
+function decodeInvoiceLog(log: RawLog): InvoicePayment | null {
+  const topics = log.topics;
   if (topics.length < 4) return null;
 
   let value: bigint;
@@ -257,6 +276,8 @@ export async function findInvoicePayment({
   since,
 }: {
   invoiceId: string;
+  /** The address that must have received it. Never `tx.to`. */
+  payee: string;
   /** Unix seconds the invoice was created. Bounds the walk. */
   since?: number;
 }): Promise<InvoicePayment | null> {
@@ -264,14 +285,6 @@ export async function findInvoicePayment({
 
   const client = rpcClient();
   const memo = packMemo(invoiceId);
-  const toTopic = `0x${"0".repeat(24)}${getAddress(payee).slice(2).toLowerCase()}` as `0x${string}`;
-
-  const topics = [TRANSFER_WITH_MEMO_TOPIC, null, toTopic, memo] as [
-    `0x${string}`,
-    null,
-    `0x${string}`,
-    `0x${string}`,
-  ];
 
   const head = await client.getBlockNumber();
 
@@ -294,7 +307,8 @@ export async function findInvoicePayment({
 
     const logs = await client.getLogs({
       address: PATHUSD_ADDRESS,
-      topics,
+      event: TRANSFER_WITH_MEMO_EVENT,
+      args: { to: getAddress(payee), memo },
       fromBlock: bottom,
       toBlock: top,
     });
