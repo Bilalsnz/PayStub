@@ -1,7 +1,12 @@
 import type { EIP1193Provider } from "viem";
 import { createConfig, http, injected } from "wagmi";
 
-import { tempoMainnet, tempoTestnet } from "./chains";
+import {
+  TEMPO_ADD_CHAIN_PARAMS,
+  TEMPO_CHAIN_HEX,
+  tempoMainnet,
+  tempoTestnet,
+} from "./chains";
 
 export type WalletId = "okx" | "metamask" | "rabby";
 
@@ -67,6 +72,108 @@ export function okxDeepLink(url: string): string {
   return `https://web3.okx.com/download?deeplink=${encodeURIComponent(
     `okx://wallet/dapp/url?dappUrl=${encodeURIComponent(url)}`,
   )}`;
+}
+
+type RequestProvider = {
+  request: (args: { method: string; params?: unknown[] }) => Promise<unknown>;
+};
+
+function asRequestProvider(value: unknown): RequestProvider | null {
+  const candidate = value as { request?: unknown } | null | undefined;
+  return candidate && typeof candidate.request === "function"
+    ? (candidate as RequestProvider)
+    : null;
+}
+
+/** Whatever wallet this browser has, when no specific connector is in play. */
+export function getInjectedProvider(): RequestProvider | undefined {
+  const w = readWindow();
+  if (w.okxwallet?.request) return w.okxwallet as RequestProvider;
+  if (w.ethereum?.request) return w.ethereum as RequestProvider;
+  return undefined;
+}
+
+/** The EIP-1193 provider behind a wagmi connector, if it can produce one. */
+export async function providerFor(
+  connector: { getProvider: (parameters?: { chainId?: number }) => Promise<unknown> } | undefined,
+): Promise<unknown> {
+  if (!connector) return undefined;
+  try {
+    return await connector.getProvider();
+  } catch {
+    return undefined;
+  }
+}
+
+export function errorMessage(error: unknown): string {
+  if (!error) return "";
+  const e = error as { shortMessage?: string; message?: string; cause?: unknown };
+  const cause = e.cause as { shortMessage?: string; message?: string } | undefined;
+  return e.shortMessage ?? cause?.shortMessage ?? e.message ?? cause?.message ?? String(error);
+}
+
+export function errorCode(error: unknown): number | undefined {
+  const e = error as { code?: number; cause?: { code?: number } } | undefined;
+  return e?.code ?? e?.cause?.code;
+}
+
+export function isUserRejection(error: unknown): boolean {
+  if (errorCode(error) === 4001) return true;
+  return /user (rejected|denied|cancell?ed)|rejected the request/i.test(errorMessage(error));
+}
+
+/**
+ * OKX mobile sometimes parks `wallet_switchEthereumChain` behind a phishing
+ * wall. That is a wallet screen, not a crash — say what to do and let them pay.
+ */
+export const SWITCH_HELP =
+  "Open this site in MetaMask browser, or tap Continue anyway in OKX. Then pay.";
+
+/**
+ * Runs before every payment. Connects nothing, signs nothing — it only makes
+ * sure the wallet is looking at Tempo, adding the chain if it has never seen it
+ * (wallet error 4902).
+ *
+ * 42431 in hex is 0xa5bf. That lives in lib/chains.ts; nothing here spells it
+ * out again, so there is exactly one place for it to be wrong.
+ */
+export async function ensureTempoChain(provider?: unknown): Promise<void> {
+  const active = asRequestProvider(provider) ?? asRequestProvider(getInjectedProvider());
+  if (!active) {
+    throw new Error("No wallet in this browser. Connect one first.");
+  }
+
+  const current = await active.request({ method: "eth_chainId" });
+  if (typeof current === "string" && current.toLowerCase() === TEMPO_CHAIN_HEX) return;
+
+  try {
+    await active.request({
+      method: "wallet_switchEthereumChain",
+      params: [{ chainId: TEMPO_CHAIN_HEX }],
+    });
+  } catch (error) {
+    if (errorCode(error) !== 4902) throw error;
+
+    await active.request({
+      method: "wallet_addEthereumChain",
+      params: [TEMPO_ADD_CHAIN_PARAMS],
+    });
+
+    // Some wallets switch on add, some only add. Ask once more, quietly.
+    try {
+      await active.request({
+        method: "wallet_switchEthereumChain",
+        params: [{ chainId: TEMPO_CHAIN_HEX }],
+      });
+    } catch {
+      /* verified below */
+    }
+  }
+
+  const after = await active.request({ method: "eth_chainId" });
+  if (typeof after !== "string" || after.toLowerCase() !== TEMPO_CHAIN_HEX) {
+    throw new Error(SWITCH_HELP);
+  }
 }
 
 /**

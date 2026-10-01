@@ -1,6 +1,16 @@
-import { formatUnits, getAddress, hexToBytes, isAddress, parseUnits } from "viem";
+import {
+  createPublicClient,
+  formatUnits,
+  getAddress,
+  hexToBytes,
+  http,
+  isAddress,
+  parseUnits,
+  type Log,
+  type PublicClient,
+} from "viem";
 
-import { TEMPO_EXPLORER_URL, TEMPO_RPC_URL } from "./chains";
+import { TEMPO_EXPLORER_URL, TEMPO_RPC_URL, tempoTestnet } from "./chains";
 
 export const PATHUSD_ADDRESS =
   "0x20c0000000000000000000000000000000000000" as const;
@@ -159,4 +169,166 @@ export async function faucet(address: string): Promise<FaucetResult> {
         "Could not reach the faucet from this browser. The curl command in the README does the same thing.",
     };
   }
+}
+
+/* ─────────────────────────── invoice matching ─────────────────────────── */
+
+/**
+ * Topic0 of `TransferWithMemo`, measured against live Moderato logs.
+ *
+ * The memo is an INDEXED topic on that event (topic[3]), and that single fact
+ * is the whole product: it lets the node answer "has INV-0841 been paid to this
+ * address?" as a log query. No indexer, no database, no server of ours.
+ */
+export const TRANSFER_WITH_MEMO_TOPIC: `0x${string}` =
+  "0x57bc7354aa85aed339e000bccffabbc529466af35f0772c8f8ee1145927de7f0";
+
+/** The node rejects any eth_getLogs wider than 100,000 blocks. Measured, not guessed. */
+export const MAX_LOG_RANGE = 100_000;
+
+/** Measured on Moderato: 10,000 blocks took 5.98 seconds. */
+export const TEMPO_BLOCK_SECONDS = 0.598;
+
+/** How far back an invoice with no known creation time is willing to walk. */
+const CHUNK = 50_000n;
+const MAX_CHUNKS = 6;
+
+let cachedClient: PublicClient | null = null;
+
+function rpcClient(): PublicClient {
+  if (!cachedClient) {
+    cachedClient = createPublicClient({
+      chain: tempoTestnet,
+      transport: http(TEMPO_RPC_URL, { timeout: 20_000 }),
+    });
+  }
+  return cachedClient;
+}
+
+export type InvoicePayment = {
+  txHash: `0x${string}`;
+  from: `0x${string}`;
+  to: `0x${string}`;
+  value: bigint;
+  /** The invoice id decoded back out of the memo. */
+  invoiceId: string;
+  blockNumber: bigint;
+};
+
+function decodeInvoiceLog(log: Log): InvoicePayment | null {
+  const topics = log.topics as readonly string[];
+  if (topics.length < 4) return null;
+
+  let value: bigint;
+  try {
+    value = BigInt(log.data);
+  } catch {
+    return null;
+  }
+
+  return {
+    txHash: log.transactionHash as `0x${string}`,
+    from: `0x${topics[1].slice(26)}` as `0x${string}`,
+    to: `0x${topics[2].slice(26)}` as `0x${string}`,
+    value,
+    invoiceId: unpackMemo(topics[3]),
+    blockNumber: log.blockNumber as bigint,
+  };
+}
+
+/**
+ * Finds the payment for one invoice by asking the chain, not a database.
+ *
+ * The query is exact, and it is exact because the memo is indexed:
+ *   topic0 = TransferWithMemo, topic[2] = payee, topic[3] = INV-xxxx in bytes32
+ *
+ * Two things this deliberately cannot get wrong, both of which bit the earlier
+ * receipt page: a plain `Transfer` can never match a topic0 of
+ * `TransferWithMemo`, so the *second* event a `transferWithMemo` call emits is
+ * never double-counted; and Tempo's TIP-20 gas fee is a plain `Transfer` to the
+ * fee collector, so it can never be mistaken for the payment either.
+ *
+ * Walks newest-first and stops at the first hit. A fresh invoice is one call;
+ * an older one steps backwards a chunk at a time.
+ */
+export async function findInvoicePayment({
+  invoiceId,
+  payee,
+  since,
+}: {
+  invoiceId: string;
+  /** Unix seconds the invoice was created. Bounds the walk. */
+  since?: number;
+}): Promise<InvoicePayment | null> {
+  if (!isAddress(payee)) return null;
+
+  const client = rpcClient();
+  const memo = packMemo(invoiceId);
+  const toTopic = `0x${"0".repeat(24)}${getAddress(payee).slice(2).toLowerCase()}` as `0x${string}`;
+
+  const topics = [TRANSFER_WITH_MEMO_TOPIC, null, toTopic, memo] as [
+    `0x${string}`,
+    null,
+    `0x${string}`,
+    `0x${string}`,
+  ];
+
+  const head = await client.getBlockNumber();
+
+  // A day is ~144k blocks at 0.598s, so a fresh invoice needs one chunk and an
+  // old one walks the whole budget. Clock skew between two phones is real, so
+  // pad the window generously rather than trimming it.
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const ageSeconds = since && since > 0 ? Math.max(0, nowSeconds - since) : Number.POSITIVE_INFINITY;
+  const budget = CHUNK * BigInt(MAX_CHUNKS);
+  const wanted = Number.isFinite(ageSeconds)
+    ? BigInt(Math.ceil(ageSeconds / TEMPO_BLOCK_SECONDS) + 5_000)
+    : budget;
+  const reach = wanted > budget ? budget : wanted;
+  const stopAt = head > reach ? head - reach : 0n;
+
+  let top = head;
+  for (let step = 0; step <= MAX_CHUNKS; step += 1) {
+    const raw = top > CHUNK ? top - CHUNK : 0n;
+    const bottom = raw < stopAt ? stopAt : raw;
+
+    const logs = await client.getLogs({
+      address: PATHUSD_ADDRESS,
+      topics,
+      fromBlock: bottom,
+      toBlock: top,
+    });
+
+    const first = logs[0];
+    if (first) return decodeInvoiceLog(first);
+
+    if (bottom <= stopAt || bottom === 0n) return null;
+    top = bottom - 1n;
+  }
+
+  return null;
+}
+
+/** Block timestamp for the paid line, in the same bigint shape formatTime wants. */
+export async function blockTimestamp(blockNumber: bigint): Promise<bigint | null> {
+  try {
+    const block = await rpcClient().getBlock({ blockNumber });
+    return block?.timestamp ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Waits for the payment to land: one-second polls, 30-second ceiling. Blocks
+ * here are 0.598s, so a payment is normally visible on the first poll.
+ */
+export async function waitForPayment(hash: `0x${string}`): Promise<boolean> {
+  const receipt = await rpcClient().waitForTransactionReceipt({
+    hash,
+    pollingInterval: 1_000,
+    timeout: 30_000,
+    confirmations: 1,
+  });
+  return receipt.status === "success";
 }

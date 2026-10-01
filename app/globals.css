@@ -12,6 +12,8 @@
   --color-line: #e5e7eb;
   --color-warn-bg: #fef3c7;
   --color-warn-ink: #92400e;
+  /* The PAID pill. Green, deliberately not neon. */
+  --color-ok: #16a34a;
 
   --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
     "Helvetica Neue", Arial, "Noto Sans", sans-serif;

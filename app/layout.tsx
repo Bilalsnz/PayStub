@@ -4,9 +4,9 @@ import { Providers } from "./providers";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "PayStub — a receipt both sides can trust",
+  title: "PayStub — invoice a job, get paid in USD",
   description:
-    "Pay a job in USD on Tempo. Both of you open the same page: paid, amount, note, proof.",
+    "Create an invoice. Send the link. When pathUSD lands on Tempo, it flips to PAID.",
 };
 
 export const viewport: Viewport = {
